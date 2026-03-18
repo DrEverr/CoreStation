@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# guest-build: Build a CoreStation sub-VM guest as a raw PVM code blob.
+#
+# This produces a .pvm file containing ONLY the inner code blob
+# (deblob format: jump_table + code + bitmask) suitable for host_machine().
+#
+# Usage:
+#   ./guest-build <guest_dir_name>
+#   ./guest-build guest_hello
+#
+# Output: <guest_dir>/build/guest.pvm  (raw code blob)
+#         <guest_dir>/build/guest.jam  (full JAM service, for reference)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORESTATION_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DOCKER_IMAGE="ghcr.io/dreverr/jamc3"
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: guest-build <guest_name>" >&2
+    echo "" >&2
+    echo "Available guests:" >&2
+    for d in "${SCRIPT_DIR}"/guest_*/; do
+        [[ -d "$d" ]] || continue
+        echo "  $(basename "$d")" >&2
+    done
+    exit 1
+fi
+
+NAME="$1"
+GUEST_DIR="${CORESTATION_DIR}/${NAME}"
+
+if [[ ! -d "$GUEST_DIR" ]]; then
+    echo "Error: $GUEST_DIR not found" >&2
+    exit 1
+fi
+
+echo "=== Building ${NAME} as sub-VM guest blob ==="
+mkdir -p "${GUEST_DIR}/build"
+
+# Step 1-5: Build .polkavm and .jam inside Docker
+docker run --rm --platform=linux/amd64 \
+    -v "${GUEST_DIR}:/guest" \
+    -v "${CORESTATION_DIR}/programs/guest_stubs.c:/stubs/guest_stubs.c:ro" \
+    -v "${GUEST_DIR}/build:/output" \
+    -w /tmp/build \
+    --entrypoint /bin/bash \
+    "${DOCKER_IMAGE}" \
+    -c '
+set -euo pipefail
+
+mkdir -p obj
+
+echo "  Compiling C3..."
+c3c compile-only \
+    --target elf-riscv64 \
+    --use-stdlib=no \
+    --link-libc=no \
+    --reloc=pic \
+    --riscv-cpu=rvimac \
+    --riscv-abi=int-only \
+    -g0 -O0 \
+    --obj-out obj/ \
+    /guest/*.c3
+
+echo "  Compiling stubs..."
+clang \
+    --target=riscv64-unknown-none-elf \
+    -march=rv64imac_zbb \
+    -mabi=lp64 \
+    -fpic -fPIE -mrelax \
+    -nostdinc -nostdlib -fno-builtin \
+    -c -o obj/guest_stubs.o \
+    /stubs/guest_stubs.c
+
+echo "  Linking..."
+ld.lld \
+    --emit-relocs --no-relax --entry=0 --error-limit=0 \
+    --unresolved-symbols=ignore-all \
+    -o guest.elf obj/*.o
+
+echo "  polkatool link..."
+polkatool link \
+    --dispatch-table "guest_main" \
+    --min-stack-size 4096 \
+    guest.elf -o /output/guest.polkavm
+
+echo "  polkavm-to-jam..."
+polkavm-to-jam /output/guest.polkavm -o /output/guest.jam 2>/dev/null || true
+
+echo "  Docker build done."
+'
+
+# Step 6: Extract code blob on host
+echo "  Extracting code blob..."
+node "${SCRIPT_DIR}/extract-code-blob.mjs" \
+    "${GUEST_DIR}/build/guest.polkavm" \
+    "${GUEST_DIR}/build/guest.pvm"
+
+echo ""
+echo "=== Output ==="
+ls -la "${GUEST_DIR}/build/"guest.* 2>/dev/null
+echo ""
+echo "guest.pvm = raw code blob for host_machine() (sub-VM)"
+echo "guest.jam = full JAM service blob (for size comparison)"
