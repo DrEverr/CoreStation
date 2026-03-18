@@ -76,7 +76,7 @@ You can run and debug `.pvm` code blobs locally using
 debugger/emulator. Install it globally via `npm`:
 
 ```bash
-npm install -g @fluffylabs/anan-as
+npm install -g @fluffylabs/anan-as@next
 ```
 
 Since `.pvm` files are raw code blobs with no embedded memory layout, you must
