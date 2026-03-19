@@ -4,7 +4,7 @@
 // needs to build the dispatch table for guest programs.
 //
 // Guest programs have a single entry point: guest_main.
-// No host imports, just the export declaration.
+// No host imports (no refine/accumulate, no host call functions).
 
 typedef unsigned long long uint64_t;
 
@@ -45,6 +45,20 @@ static void __attribute__ ((naked, used)) CONCAT(polkavm_export_dummy_, fn_name)
     ); \
 }
 
-// Export the guest entry point: guest_main(uint64_t argc, uint64_t* argv) -> uint64_t
-// 2 input registers, 1 output register
+// ---- Builtins required by C3 for local arrays ----
+
+void *memset(void *s, int c, unsigned long n) {
+    unsigned char *p = s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+void *memcpy(void *dest, const void *src, unsigned long n) {
+    unsigned char *d = dest;
+    const unsigned char *s = src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+// Export: guest_main(argv, argc) -> result
 GUEST_EXPORT(guest_main, 2, 1)

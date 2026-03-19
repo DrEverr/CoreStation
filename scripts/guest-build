@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# guest-build: Build a CoreStation sub-VM guest as a raw PVM code blob.
+# guest-build: Build a CoreStation sub-VM guest as a PVM service blob.
 #
-# This produces a .pvm file containing ONLY the inner code blob
-# (deblob format: jump_table + code + bitmask) suitable for host_machine().
+# This produces a .pvm file in JAM SPI format (RO data + RW data + code)
+# with a minimal stub that exports only guest_main (no host call imports,
+# no refine/accumulate).
 #
 # Usage:
 #   ./guest-build <guest_dir_name>
-#   ./guest-build guest_hello
+#   ./guest-build programs/hello
 #
-# Output: <guest_dir>/build/guest.pvm  (raw code blob)
-#         <guest_dir>/build/guest.jam  (full JAM service, for reference)
+# Output: <guest_dir>/build/guest.pvm       (JAM SPI blob)
+#         <guest_dir>/build/guest.polkavm   (intermediate PolkaVM binary)
 
 set -euo pipefail
 
@@ -87,20 +88,13 @@ polkatool link \
     guest.elf -o /output/guest.polkavm
 
 echo "  polkavm-to-jam..."
-polkavm-to-jam /output/guest.polkavm -o /output/guest.jam 2>/dev/null || true
+polkavm-to-jam /output/guest.polkavm -o /output/guest.pvm
 
 echo "  Docker build done."
 '
-
-# Step 6: Extract code blob on host
-echo "  Extracting code blob..."
-node "${SCRIPT_DIR}/extract-code-blob.mjs" \
-    "${GUEST_DIR}/build/guest.polkavm" \
-    "${GUEST_DIR}/build/guest.pvm"
 
 echo ""
 echo "=== Output ==="
 ls -la "${GUEST_DIR}/build/"guest.* 2>/dev/null
 echo ""
-echo "guest.pvm = raw code blob for host_machine() (sub-VM)"
-echo "guest.jam = full JAM service blob (for size comparison)"
+echo "guest.pvm = JAM SPI blob (RO + RW data + code, exports only guest_main)"

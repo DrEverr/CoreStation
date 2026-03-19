@@ -1,12 +1,12 @@
 # Guest Programs
 
 Sub-VM guest programs that run inside CoreStation via `host_machine()`.  
-Each program is a raw PVM code blob — no JAM service boilerplate.
+Each program is a `.pvm` blob in JAM SPI format — RO data, RW data, and code
+packaged together with a minimal stub that exports only `guest_main`.
 
 ## Prerequisites
 
 - Docker (the build runs inside `ghcr.io/dreverr/jamc3`)
-- Node.js (for the code-blob extraction step)
 
 ## Building
 
@@ -24,11 +24,55 @@ Build a guest by passing its directory name under `programs/` to the `guest-buil
 
 ```
 programs/hello/build/
-  guest.polkavm    # Full PolkaVM binary
-  guest.pvm        # Raw code blob for host_machine() (this is what CoreStation loads)
-  guest.jam        # Full JAM service blob (for size comparison only)
-  guest.ro         # Required ReadOnly data to be provided at address @ 0x10000
+  guest.polkavm    # Intermediate PolkaVM binary
+  guest.pvm        # JAM SPI blob (this is what CoreStation loads)
 ```
+
+### What's in the .pvm file
+
+The `.pvm` file is a JAM SPI (Service Program Image) with:
+- Read-only data (string literals, constants)
+- Read-write data (global buffers like the console)
+- PVM code blob (jump table + bytecode + bitmask)
+
+But unlike a full JAM service, the stub only exports `guest_main` — no `refine`,
+`accumulate`, or host call imports. This is the correct format for sub-VM
+guests that run inside a host service via `host_machine()`.
+
+### SPI memory layout
+
+```
+0x00000000  Guard (unmapped)
+0x00010000  RO data (string literals, constants)
+0x00020000+ RW data (global buffers — address depends on RO size)
+  ...
+STACK_TOP   Stack (grows downward)
+0xFEFE0000  Stack segment end
+0xFEFF0000  Arguments (read-only, r7 points here, r8 = length)
+```
+
+**RW base address** (where globals live):
+
+```
+ro_pages = ceil(ro_size / 4096)
+rw_base  = 0x10000 + 0x10000 * (1 + ro_pages)    when ro_size > 0
+rw_base  = 0x20000                                 when ro_size = 0
+```
+
+Examples: `ro=0` → RW at `0x20000`, `ro=44` → RW at `0x30000`, `ro=4097` → RW at `0x40000`.
+
+**Stack range**:
+
+```
+stack_bottom = 0xFEFE0000 - stack_size
+stack_top    = 0xFEFE0000
+r0 (SP)      = 0xFFFF0000
+r1 (FP)      = 0xFEFE0000
+```
+
+Stack size is set by `--min-stack-size` in the build script (default: 4096).
+The stack is writable and does not add to blob size — only the size value
+is stored in the SPI header.
 
 ## Writing a new guest
 
@@ -44,11 +88,11 @@ mkdir programs/myguest
 // programs/myguest/myguest.c3
 module guest_myguest;
 
-fn ulong guest_main(ulong argc, ulong* argv) @export("guest_main")
+fn ulong guest_main(char* argv, ulong argc) @export("guest_main")
 {
-    // argc = number of arguments
-    // argv = pointer to argument array
-    // return value passed back via register
+    // argv = pointer to arguments buffer (read-only)
+    // argc = length of arguments in bytes
+    // return value in r7
     return 42;
 }
 ```
@@ -71,7 +115,7 @@ Guests don't run on JAM standalone. CoreStation's manager service:
 
 ## Local debugging with anan-as
 
-You can run and debug `.pvm` code blobs locally using
+You can run and debug `.pvm` blobs locally using
 [anan-as](https://www.npmjs.com/package/@fluffylabs/anan-as), a PVM
 debugger/emulator. Install it globally via `npm`:
 
@@ -79,78 +123,66 @@ debugger/emulator. Install it globally via `npm`:
 npm install -g @fluffylabs/anan-as@next
 ```
 
-Since `.pvm` files are raw code blobs with no embedded memory layout, you must
-provide the stack, memory pages, and initial register values manually.
+Since `.pvm` files are JAM SPI blobs, use the `--spi` flag.
 
 ### Running the `add` guest
 
-`add` expects `r7 = argc`, `r8 = argv pointer`, and reads `u64` values from
-memory at the argv address. It returns the sum in `r7`.
+`add` reads `ulong` values from the SPI arguments buffer and returns their sum.
+Pass the values as hex-encoded SPI args (two u64 LE values: 5 and 3):
 
 ```bash
-# Sum two numbers: 5 + 3 = 8
-# Memory at 0x20000: two u64 LE values (5 and 3)
-# Registers: r0=SP, r1=FP, r7=argc(2), r8=argv(0x20000)
-anan-as run --no-metadata --no-logs --gas 100000 \
-  --regs "0xFFFF0000,0xFFFF0000,0,0,0,0,0,2,0x20000,0,0,0,0" \
-  --pages "0xFFFE0000:0x20000;0x20000:0x1000" \
-  --mem "0x20000:0500000000000000;0x20008:0300000000000000" \
-  programs/add/build/guest.pvm
+# Sum 5 + 3 = 8
+anan-as run --spi --no-logs --gas 100000 \
+  programs/add/build/guest.pvm 0x05000000000000000300000000000000
 ```
 
 Expected output: status HALT, `r7 = 8`.
 
-To also dump the memory region after execution:
-
-```bash
-anan-as run --no-metadata --no-logs --gas 100000 \
-  --regs "0xFFFF0000,0xFFFF0000,0,0,0,0,0,2,0x20000,0,0,0,0" \
-  --pages "0xFFFE0000:0x20000;0x20000:0x1000" \
-  --mem "0x20000:0500000000000000;0x20008:0300000000000000" \
-  --dump "0x20000:64" \
-  programs/add/build/guest.pvm
-```
-
 ### Running the `hello` guest
 
-`hello` expects `r7 = argc`, `r8 = argv pointer` where argv points to an I/O
-buffer (tick count, keyboard state, console text). It writes console output
-back into that same buffer.
+`hello` reads a tick count and text from the SPI arguments (read-only),
+writes output to a global console buffer in the RW segment, and returns
+tick+1. Pass tick=5 and text "Hello JAM" as SPI args:
 
 ```bash
-# Tick 1, no keyboard input — writes "CoreMini sub-VM guest! Tick: 1" to console
-anan-as run --no-metadata --no-logs --gas 100000 \
-  --regs "0xFFFF0000,0xFFFF0000,0,0,0,0,0,0,0x20000,0,0,0,0" \
-  --pages "0xFFFE0000:0x20000;0x20000:0x1000;0x10000:0x1000:r" \
-  --mem "0x20000:0100000000;0x10000:$(xxd -p -c9999 programs/hello/build/guest.ro)" \
-  --dump "0x2010a:80" \
-  programs/hello/build/guest.pvm
+# tick=5 (u32 LE) + "Hello JAM" (ASCII)
+anan-as run --spi --no-logs --gas 1000000 \
+  --dump "0x30000:0xa0" \
+  programs/hello/build/guest.pvm 0x0500000048656c6c6f204a414d
 ```
 
-The `--dump` at offset `0x2010a` (= `0x20000 + 266`) shows the console text
-buffer where the guest writes its output.
+Expected output: status HALT, `r7 = 6` (tick incremented), and the dump
+at `0x30000` shows:
+
+```
+Hello from PVM! Tick:5
+Text: Hello JAM
+```
+
+The console buffer is a global `char[2000]` in the RW data segment,
+mapped at a fixed address (`0x30000` for this build). The host can
+`host_peek` this address to read the console output.
 
 ### Disassembling a guest
 
 ```bash
-anan-as disassemble --no-metadata programs/add/build/guest.pvm
+anan-as disassemble --spi programs/add/build/guest.pvm
 ```
 
-### Register conventions
+### SPI register conventions
 
 | Register | ABI Name | Convention |
 |----------|----------|------------|
-| r0 | SP | Stack pointer (set to top of stack) |
-| r1 | RA/FP | Return address / frame pointer (set = SP) |
-| r7 | a0 | First argument / return value |
-| r8 | a1 | Second argument |
-| r9 | a2 | Third argument |
+| r0 | SP | Stack pointer (set by SPI loader) |
+| r1 | RA/FP | Return address / frame pointer |
+| r7 | a0 | argv — pointer to arguments buffer / return value |
+| r8 | a1 | argc — length of arguments in bytes |
 
 ### Key flags
 
 | Flag | Description |
 |------|-------------|
-| `--no-metadata` | Input is a raw code blob (no metadata prefix) |
+| `--spi` | Input is a JAM SPI blob (.pvm file) |
 | `--no-logs` | Suppress per-instruction trace (remove for step-by-step debugging) |
 | `--gas <n>` | Gas budget (default: 10000) |
 | `--regs <csv>` | 13 comma-separated register values r0-r12 (supports `0x` hex) |
